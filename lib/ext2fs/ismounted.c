@@ -41,6 +41,7 @@
 #include "ext2_fs.h"
 #include "ext2fs.h"
 
+#ifdef HAVE_SETMNTENT
 /*
  * Check to see if a regular file is mounted.
  * If /etc/mtab/ is a symlink of /proc/mounts, you will need the following check
@@ -71,7 +72,6 @@ static int check_loop_mounted(const char *mnt_fsname, dev_t mnt_rdev,
 	return 0;
 }
 
-#ifdef HAVE_SETMNTENT
 /*
  * Helper function which checks a file in /etc/mtab format to see if a
  * filesystem is mounted.  Returns an error if the file doesn't exist
