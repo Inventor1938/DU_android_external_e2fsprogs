@@ -172,6 +172,14 @@ extern void do_filefrag(int argc, char *argv[]);
 
 /* util.c */
 extern time_t string_to_time(const char *arg);
+errcode_t read_list(char *str, blk64_t **list, size_t *len);
+
+/* xattrs.c */
+void dump_inode_attributes(FILE *out, ext2_ino_t ino);
+void do_get_xattr(int argc, char **argv);
+void do_set_xattr(int argc, char **argv);
+void do_rm_xattr(int argc, char **argv);
+void do_list_xattr(int argc, char **argv);
 
 /* zap.c */
 extern void do_zap_block(int argc, char **argv);

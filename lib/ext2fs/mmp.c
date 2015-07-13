@@ -30,6 +30,11 @@
 #define O_DIRECT 0
 #endif
 
+#pragma GCC diagnostic push
+#ifndef CONFIG_MMP
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
 errcode_t ext2fs_mmp_read(ext2_filsys fs, blk64_t mmp_blk, void *buf)
 {
 	struct mmp_struct *mmp_cmp;
@@ -397,3 +402,4 @@ errcode_t ext2fs_mmp_update(ext2_filsys fs)
 mmp_error:
 	return retval;
 }
+#pragma GCC diagnostic pop

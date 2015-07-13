@@ -63,7 +63,14 @@ char *get_progname(char *argv_zero)
 		return cp+1;
 }
 
-void proceed_question(void)
+static jmp_buf alarm_env;
+
+static void alarm_signal(int signal EXT2FS_ATTR((unused)))
+{
+	longjmp(alarm_env, 1);
+}
+
+void proceed_question(int delay)
 {
 	char buf[256];
 	const char *short_yes = _("yY");

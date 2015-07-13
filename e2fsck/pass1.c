@@ -545,6 +545,277 @@ void e2fsck_setup_tdb_icount(e2fsck_t ctx, int flags,
 		*ret = 0;
 }
 
+static errcode_t recheck_bad_inode_checksum(ext2_filsys fs, ext2_ino_t ino,
+					    e2fsck_t ctx,
+					    struct problem_context *pctx)
+{
+	errcode_t retval;
+	struct ext2_inode_large inode;
+
+	/*
+	 * Reread inode.  If we don't see checksum error, then this inode
+	 * has been fixed elsewhere.
+	 */
+	ctx->stashed_ino = 0;
+	retval = ext2fs_read_inode_full(fs, ino, (struct ext2_inode *)&inode,
+					sizeof(inode));
+	if (retval && retval != EXT2_ET_INODE_CSUM_INVALID)
+		return retval;
+	if (!retval)
+		return 0;
+
+	/*
+	 * Checksum still doesn't match.  That implies that the inode passes
+	 * all the sanity checks, so maybe the checksum is simply corrupt.
+	 * See if the user will go for fixing that.
+	 */
+	if (!fix_problem(ctx, PR_1_INODE_ONLY_CSUM_INVALID, pctx))
+		return 0;
+
+	retval = ext2fs_write_inode_full(fs, ino, (struct ext2_inode *)&inode,
+					 sizeof(inode));
+	return retval;
+}
+
+static void reserve_block_for_root_repair(e2fsck_t ctx)
+{
+	blk64_t		blk = 0;
+	errcode_t	err;
+	ext2_filsys	fs = ctx->fs;
+
+	ctx->root_repair_block = 0;
+	if (ext2fs_test_inode_bitmap2(ctx->inode_used_map, EXT2_ROOT_INO))
+		return;
+
+	err = ext2fs_new_block2(fs, 0, ctx->block_found_map, &blk);
+	if (err)
+		return;
+	ext2fs_mark_block_bitmap2(ctx->block_found_map, blk);
+	ctx->root_repair_block = blk;
+}
+
+static void reserve_block_for_lnf_repair(e2fsck_t ctx)
+{
+	blk64_t		blk = 0;
+	errcode_t	err;
+	ext2_filsys	fs = ctx->fs;
+	static const char name[] = "lost+found";
+	ext2_ino_t	ino;
+
+	ctx->lnf_repair_block = 0;
+	if (!ext2fs_lookup(fs, EXT2_ROOT_INO, name, sizeof(name)-1, 0, &ino))
+		return;
+
+	err = ext2fs_new_block2(fs, 0, ctx->block_found_map, &blk);
+	if (err)
+		return;
+	ext2fs_mark_block_bitmap2(ctx->block_found_map, blk);
+	ctx->lnf_repair_block = blk;
+}
+
+static errcode_t get_inline_data_ea_size(ext2_filsys fs, ext2_ino_t ino,
+					 size_t *sz)
+{
+	void *p;
+	struct ext2_xattr_handle *handle;
+	errcode_t retval;
+
+	retval = ext2fs_xattrs_open(fs, ino, &handle);
+	if (retval)
+		return retval;
+
+	retval = ext2fs_xattrs_read(handle);
+	if (retval)
+		goto err;
+
+	retval = ext2fs_xattr_get(handle, "system.data", &p, sz);
+	if (retval)
+		goto err;
+	ext2fs_free_mem(&p);
+err:
+	(void) ext2fs_xattrs_close(&handle);
+	return retval;
+}
+
+static void finish_processing_inode(e2fsck_t ctx, ext2_ino_t ino,
+				    struct problem_context *pctx,
+				    int failed_csum)
+{
+	if (!failed_csum)
+		return;
+
+	/*
+	 * If the inode failed the checksum and the user didn't
+	 * clear the inode, test the checksum again -- if it still
+	 * fails, ask the user if the checksum should be corrected.
+	 */
+	pctx->errcode = recheck_bad_inode_checksum(ctx->fs, ino, ctx, pctx);
+	if (pctx->errcode)
+		ctx->flags |= E2F_FLAG_ABORT;
+}
+#define FINISH_INODE_LOOP(ctx, ino, pctx, failed_csum) \
+	do { \
+		finish_processing_inode((ctx), (ino), (pctx), (failed_csum)); \
+		if ((ctx)->flags & E2F_FLAG_ABORT) \
+			return; \
+	} while (0)
+
+static int could_be_block_map(ext2_filsys fs, struct ext2_inode *inode)
+{
+	__u32 x;
+	int i;
+
+	for (i = 0; i < EXT2_N_BLOCKS; i++) {
+		x = inode->i_block[i];
+#ifdef WORDS_BIGENDIAN
+		x = ext2fs_swab32(x);
+#endif
+		if (x >= ext2fs_blocks_count(fs->super))
+			return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * Figure out what to do with an inode that has both extents and inline data
+ * inode flags set.  Returns -1 if we decide to erase the inode, 0 otherwise.
+ */
+static int fix_inline_data_extents_file(e2fsck_t ctx,
+					ext2_ino_t ino,
+					struct ext2_inode *inode,
+					int inode_size,
+					struct problem_context *pctx)
+{
+	size_t max_inline_ea_size;
+	ext2_filsys fs = ctx->fs;
+	int dirty = 0;
+
+	/* Both feature flags not set?  Just run the regular checks */
+	if (!EXT2_HAS_INCOMPAT_FEATURE(fs->super,
+				       EXT3_FEATURE_INCOMPAT_EXTENTS) &&
+	    !EXT2_HAS_INCOMPAT_FEATURE(fs->super,
+				       EXT4_FEATURE_INCOMPAT_INLINE_DATA))
+		return 0;
+
+	/* Clear both flags if it's a special file */
+	if (LINUX_S_ISCHR(inode->i_mode) ||
+	    LINUX_S_ISBLK(inode->i_mode) ||
+	    LINUX_S_ISFIFO(inode->i_mode) ||
+	    LINUX_S_ISSOCK(inode->i_mode)) {
+		check_extents_inlinedata(ctx, pctx);
+		return 0;
+	}
+
+	/* If it looks like an extent tree, try to clear inlinedata */
+	if (ext2fs_extent_header_verify(inode->i_block,
+				 sizeof(inode->i_block)) == 0 &&
+	    fix_problem(ctx, PR_1_CLEAR_INLINE_DATA_FOR_EXTENT, pctx)) {
+		inode->i_flags &= ~EXT4_INLINE_DATA_FL;
+		dirty = 1;
+		goto out;
+	}
+
+	/* If it looks short enough to be inline data, try to clear extents */
+	if (inode_size > EXT2_GOOD_OLD_INODE_SIZE)
+		max_inline_ea_size = inode_size -
+				     (EXT2_GOOD_OLD_INODE_SIZE +
+				      ((struct ext2_inode_large *)inode)->i_extra_isize);
+	else
+		max_inline_ea_size = 0;
+	if (EXT2_I_SIZE(inode) <
+	    EXT4_MIN_INLINE_DATA_SIZE + max_inline_ea_size &&
+	    fix_problem(ctx, PR_1_CLEAR_EXTENT_FOR_INLINE_DATA, pctx)) {
+		inode->i_flags &= ~EXT4_EXTENTS_FL;
+		dirty = 1;
+		goto out;
+	}
+
+	/*
+	 * Too big for inline data, but no evidence of extent tree -
+	 * maybe it's a block map file?  If the mappings all look valid?
+	 */
+	if (could_be_block_map(fs, inode) &&
+	    fix_problem(ctx, PR_1_CLEAR_EXTENT_INLINE_DATA_FLAGS, pctx)) {
+#ifdef WORDS_BIGENDIAN
+		int i;
+
+		for (i = 0; i < EXT2_N_BLOCKS; i++)
+			inode->i_block[i] = ext2fs_swab32(inode->i_block[i]);
+#endif
+
+		inode->i_flags &= ~(EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL);
+		dirty = 1;
+		goto out;
+	}
+
+	/* Oh well, just clear the busted inode. */
+	if (fix_problem(ctx, PR_1_CLEAR_EXTENT_INLINE_DATA_INODE, pctx)) {
+		e2fsck_clear_inode(ctx, ino, inode, 0, "pass1");
+		return -1;
+	}
+
+out:
+	if (dirty)
+		e2fsck_write_inode(ctx, ino, inode, "pass1");
+
+	return 0;
+}
+
+static void pass1_readahead(e2fsck_t ctx, dgrp_t *group, ext2_ino_t *next_ino)
+{
+	ext2_ino_t inodes_in_group = 0, inodes_per_block, inodes_per_buffer;
+	dgrp_t start = *group, grp;
+	blk64_t blocks_to_read = 0;
+	errcode_t err = EXT2_ET_INVALID_ARGUMENT;
+
+	if (ctx->readahead_kb == 0)
+		goto out;
+
+	/* Keep iterating groups until we have enough to readahead */
+	inodes_per_block = EXT2_INODES_PER_BLOCK(ctx->fs->super);
+	for (grp = start; grp < ctx->fs->group_desc_count; grp++) {
+		if (ext2fs_bg_flags_test(ctx->fs, grp, EXT2_BG_INODE_UNINIT))
+			continue;
+		inodes_in_group = ctx->fs->super->s_inodes_per_group -
+					ext2fs_bg_itable_unused(ctx->fs, grp);
+		blocks_to_read += (inodes_in_group + inodes_per_block - 1) /
+					inodes_per_block;
+		if (blocks_to_read * ctx->fs->blocksize >
+		    ctx->readahead_kb * 1024)
+			break;
+	}
+
+	err = e2fsck_readahead(ctx->fs, E2FSCK_READA_ITABLE, start,
+			       grp - start + 1);
+	if (err == EAGAIN) {
+		ctx->readahead_kb /= 2;
+		err = 0;
+	}
+
+out:
+	if (err) {
+		/* Error; disable itable readahead */
+		*group = ctx->fs->group_desc_count;
+		*next_ino = ctx->fs->super->s_inodes_count;
+	} else {
+		/*
+		 * Don't do more readahead until we've reached the first inode
+		 * of the last inode scan buffer block for the last group.
+		 */
+		*group = grp + 1;
+		inodes_per_buffer = (ctx->inode_buffer_blocks ?
+				     ctx->inode_buffer_blocks :
+				     EXT2_INODE_SCAN_DEFAULT_BUFFER_BLOCKS) *
+				    ctx->fs->blocksize /
+				    EXT2_INODE_SIZE(ctx->fs->super);
+		inodes_in_group--;
+		*next_ino = inodes_in_group -
+			    (inodes_in_group % inodes_per_buffer) + 1 +
+			    (grp * ctx->fs->super->s_inodes_per_group);
+	}
+}
+
 void e2fsck_pass1(e2fsck_t ctx)
 {
 	int	i;
@@ -563,9 +834,12 @@ void e2fsck_pass1(e2fsck_t ctx)
 	struct ext2_super_block *sb = ctx->fs->super;
 	const char	*old_op;
 	unsigned int	save_type;
-	int		imagic_fs, extent_fs;
-	int		busted_fs_time = 0;
-	int		inode_size;
+	int		imagic_fs, extent_fs, inlinedata_fs;
+	int		low_dtime_check = 1;
+	int		inode_size = EXT2_INODE_SIZE(fs->super);
+	int		failed_csum = 0;
+	ext2_ino_t	ino_threshold = 0;
+	dgrp_t		ra_group = 0;
 
 	init_resource_track(&rtrack, ctx->fs->io);
 	clear_problem_context(&pctx);
@@ -652,7 +926,6 @@ void e2fsck_pass1(e2fsck_t ctx)
 		ctx->flags |= E2F_FLAG_ABORT;
 		return;
 	}
-	inode_size = EXT2_INODE_SIZE(fs->super);
 	inode = (struct ext2_inode *)
 		e2fsck_allocate_memory(ctx, inode_size, "scratch inode");
 

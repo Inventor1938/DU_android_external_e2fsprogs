@@ -1847,34 +1847,9 @@ void do_mkdir(int argc, char *argv[])
 				"<filename>", CHECK_FS_RW))
 		return;
 
-	cp = strrchr(argv[1], '/');
-	if (cp) {
-		*cp = 0;
-		parent = string_to_inode(argv[1]);
-		if (!parent) {
-			com_err(argv[1], ENOENT, 0);
-			return;
-		}
-		name = cp+1;
-	} else {
-		parent = cwd;
-		name = argv[1];
-	}
-
-try_again:
-	retval = ext2fs_mkdir(current_fs, parent, 0, name);
-	if (retval == EXT2_ET_DIR_NO_SPACE) {
-		retval = ext2fs_expand_dir(current_fs, parent);
-		if (retval) {
-			com_err(argv[0], retval, "while expanding directory");
-			return;
-		}
-		goto try_again;
-	}
-	if (retval) {
-		com_err("ext2fs_mkdir", retval, 0);
-		return;
-	}
+	retval = do_mkdir_internal(current_fs, cwd, argv[1], root);
+	if (retval)
+		com_err(argv[0], retval, 0);
 
 }
 
@@ -2310,9 +2285,9 @@ try_again:
 
 }
 
+#if CONFIG_MMP
 void do_dump_mmp(int argc EXT2FS_ATTR((unused)), char *argv[])
 {
-	struct ext2_super_block *sb;
 	struct mmp_struct *mmp_s;
 	time_t t;
 	errcode_t retval = 0;
@@ -2350,7 +2325,18 @@ void do_dump_mmp(int argc EXT2FS_ATTR((unused)), char *argv[])
 	fprintf(stdout, "node_name: %s\n", mmp_s->mmp_nodename);
 	fprintf(stdout, "device_name: %s\n", mmp_s->mmp_bdevname);
 	fprintf(stdout, "magic: 0x%x\n", mmp_s->mmp_magic);
+	fprintf(stdout, "checksum: 0x%08x\n", mmp_s->mmp_checksum);
+	fprintf(stdout, "MMP is unsupported, please recompile with "
+	                "--enable-mmp\n");
 }
+#else
+void do_dump_mmp(int argc EXT2FS_ATTR((unused)),
+		 char *argv[] EXT2FS_ATTR((unused)))
+{
+	fprintf(stdout, "MMP is unsupported, please recompile with "
+	                "--enable-mmp\n");
+}
+#endif
 
 static int source_file(const char *cmd_file, int ss_idx)
 {

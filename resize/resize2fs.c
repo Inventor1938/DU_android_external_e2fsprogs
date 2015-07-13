@@ -1187,7 +1187,8 @@ static blk64_t get_new_block(ext2_resize_t rfs)
 	}
 }
 
-static errcode_t resize2fs_get_alloc_block(ext2_filsys fs, blk64_t goal,
+static errcode_t resize2fs_get_alloc_block(ext2_filsys fs,
+					   blk64_t goal EXT2FS_ATTR((unused)),
 					   blk64_t *ret)
 {
 	ext2_resize_t rfs = (ext2_resize_t) fs->priv_data;
@@ -1433,6 +1434,106 @@ static errcode_t progress_callback(ext2_filsys fs,
 	}
 
 	return 0;
+}
+
+static errcode_t migrate_ea_block(ext2_resize_t rfs, ext2_ino_t ino,
+				  struct ext2_inode *inode, int *changed)
+{
+	char *buf = NULL;
+	blk64_t new_block;
+	errcode_t err = 0;
+
+	/* No EA block or no remapping?  Quit early. */
+	if (ext2fs_file_acl_block(rfs->old_fs, inode) == 0 && !rfs->bmap)
+		return 0;
+	new_block = extent_translate(rfs->old_fs, rfs->bmap,
+		ext2fs_file_acl_block(rfs->old_fs, inode));
+	if (new_block == 0)
+		return 0;
+
+	/* Set the new ACL block */
+	ext2fs_file_acl_block_set(rfs->old_fs, inode, new_block);
+
+	/* Update checksum */
+	if (EXT2_HAS_RO_COMPAT_FEATURE(rfs->new_fs->super,
+			EXT4_FEATURE_RO_COMPAT_METADATA_CSUM)) {
+		err = ext2fs_get_mem(rfs->old_fs->blocksize, &buf);
+		if (err)
+			return err;
+		rfs->old_fs->flags |= EXT2_FLAG_IGNORE_CSUM_ERRORS;
+		err = ext2fs_read_ext_attr3(rfs->old_fs, new_block, buf, ino);
+		rfs->old_fs->flags &= ~EXT2_FLAG_IGNORE_CSUM_ERRORS;
+		if (err)
+			goto out;
+		err = ext2fs_write_ext_attr3(rfs->old_fs, new_block, buf, ino);
+		if (err)
+			goto out;
+	}
+	*changed = 1;
+
+out:
+	ext2fs_free_mem(&buf);
+	return err;
+}
+
+/* Rewrite extents */
+static errcode_t rewrite_extents(ext2_filsys fs, ext2_ino_t ino)
+{
+	ext2_extent_handle_t	handle;
+	struct ext2fs_extent	extent;
+	errcode_t		errcode;
+	struct ext2_extent_info	info;
+
+	errcode = ext2fs_extent_open(fs, ino, &handle);
+	if (errcode)
+		return errcode;
+
+	errcode = ext2fs_extent_get(handle, EXT2_EXTENT_ROOT, &extent);
+	if (errcode)
+		goto out;
+
+	do {
+		errcode = ext2fs_extent_get_info(handle, &info);
+		if (errcode)
+			break;
+
+		/*
+		 * If this is the first extent in an extent block that we
+		 * haven't visited, rewrite the extent to force the ETB
+		 * checksum to be rewritten.
+		 */
+		if (info.curr_entry == 1 && info.curr_level != 0 &&
+		    !(extent.e_flags & EXT2_EXTENT_FLAGS_SECOND_VISIT)) {
+			errcode = ext2fs_extent_replace(handle, 0, &extent);
+			if (errcode)
+				break;
+		}
+
+		/* Skip to the end of a block of leaf nodes */
+		if (extent.e_flags & EXT2_EXTENT_FLAGS_LEAF) {
+			errcode = ext2fs_extent_get(handle,
+						    EXT2_EXTENT_LAST_SIB,
+						    &extent);
+			if (errcode)
+				break;
+		}
+
+		errcode = ext2fs_extent_get(handle, EXT2_EXTENT_NEXT, &extent);
+	} while (errcode == 0);
+
+out:
+	/* Ok if we run off the end */
+	if (errcode == EXT2_ET_EXTENT_NO_NEXT)
+		errcode = 0;
+	ext2fs_extent_free(handle);
+	return errcode;
+}
+
+static void quiet_com_err_proc(const char *whoami EXT2FS_ATTR((unused)),
+			       errcode_t code EXT2FS_ATTR((unused)),
+			       const char *fmt EXT2FS_ATTR((unused)),
+			       va_list args EXT2FS_ATTR((unused)))
+{
 }
 
 static errcode_t inode_scan_and_fix(ext2_resize_t rfs)
